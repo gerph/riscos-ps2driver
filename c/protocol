@@ -1,0 +1,305 @@
+/*******************************************************************
+ * File:        protocol
+ * Purpose:     PS/2 command queues, device detection, and packet framing.
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <stdint.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "riscos/KEYV.h"
+#include "riscos/Vectors.h"
+#include "ps2.h"
+
+#define PS2_ACK 0xfaU
+#define PS2_RESEND 0xfeU
+#define PS2_BAT 0xaaU
+#define PS2_MOUSE_ID 0x00U
+#define PS2_COMMAND_RESET 0xffU
+#define PS2_COMMAND_SET_LEDS 0xedU
+#define PS2_COMMAND_SET_RATE 0xf3U
+#define PS2_COMMAND_SET_RESOLUTION 0xe8U
+#define PS2_COMMAND_SCALING_11 0xe6U
+#define PS2_COMMAND_ENABLE 0xf4U
+#define PS2_COMMAND_DEVICE_ID 0xf2U
+
+static const uint8_t setup_intellimouse[] =
+{
+    100, PS2_COMMAND_SET_RATE, 200, PS2_COMMAND_SET_RATE, 100,
+    PS2_COMMAND_SET_RATE, 80, PS2_COMMAND_DEVICE_ID
+};
+static const uint8_t setup_intellimouse5[] =
+{
+    PS2_COMMAND_SET_RATE, 200, PS2_COMMAND_SET_RATE, 200,
+    PS2_COMMAND_SET_RATE, 80, PS2_COMMAND_DEVICE_ID
+};
+static const uint8_t setup_normal[] =
+{
+    PS2_COMMAND_SET_RESOLUTION, 3, PS2_COMMAND_SCALING_11,
+    PS2_COMMAND_SET_RATE, 100, PS2_COMMAND_ENABLE
+};
+
+/*******************************************************************
+ Function:      PS2Protocol_QueueByte
+ Description:   Append a command byte to a channel's circular queue.
+ Parameters:    channel = destination channel, byte = byte to queue
+ Returns:       none
+ ******************************************************************/
+static void PS2Protocol_QueueByte(PS2Channel *channel, uint8_t byte)
+{
+    channel->tx_buffer[channel->tx_insert] = byte;
+    channel->tx_insert = (uint8_t)((channel->tx_insert + 1) % PS2_TX_BUFFER_SIZE);
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_PrependLastByte
+ Description:   Requeue the most recently transmitted command for resend.
+ Parameters:    channel = channel to update
+ Returns:       none
+ ******************************************************************/
+static void PS2Protocol_PrependLastByte(PS2Channel *channel)
+{
+    channel->tx_read = (uint8_t)((channel->tx_read + PS2_TX_BUFFER_SIZE - 1) %
+                                 PS2_TX_BUFFER_SIZE);
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_StartTransmit
+ Description:   Start transmission whenever a command is pending.
+ Parameters:    channel = channel to check
+ Returns:       none
+ ******************************************************************/
+static void PS2Protocol_StartTransmit(PS2Channel *channel)
+{
+    if (channel->tx_read != channel->tx_insert &&
+        (channel->state & (PS2_STATE_WANT_ACK | PS2_STATE_WANT_BAT)) == 0)
+        PS2HW_EnableTransmit(channel);
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_SendNextSetupByte
+ Description:   Send the next command in the active mouse setup sequence.
+ Parameters:    channel = mouse channel to configure
+ Returns:       none
+ ******************************************************************/
+static void PS2Protocol_SendNextSetupByte(PS2Channel *channel)
+{
+    const uint8_t *setup;
+    uint32_t count;
+
+    if (channel->setup_phase == 0)
+    {
+        setup = setup_intellimouse;
+        count = sizeof(setup_intellimouse);
+    }
+    else if (channel->setup_phase == 1)
+    {
+        setup = setup_intellimouse5;
+        count = sizeof(setup_intellimouse5);
+    }
+    else
+    {
+        setup = setup_normal;
+        count = sizeof(setup_normal);
+    }
+    if (channel->setup_index < count)
+    {
+        PS2Protocol_QueueByte(channel, setup[channel->setup_index]);
+        channel->setup_index++;
+        PS2Protocol_StartTransmit(channel);
+    }
+    else if (channel->setup_phase < 2)
+    {
+        channel->receive_state = PS2_RECEIVE_MOUSE_ID;
+        channel->setup_index = 0;
+    }
+    else
+        channel->receive_state = PS2_RECEIVE_MOUSE_PACKET_1;
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_Initialise
+ Description:   Initialise queue and receiver state for a PS/2 channel.
+ Parameters:    channel = channel to initialise
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_Initialise(PS2Channel *channel)
+{
+    channel->tx_insert = 0;
+    channel->tx_read = 0;
+    channel->state = PS2_STATE_WANT_BAT;
+    channel->resend_count = PS2_RESEND_COUNT;
+    channel->device_type = PS2_DEVICE_UNKNOWN;
+    channel->setup_index = 0;
+    channel->setup_phase = 0;
+    channel->receive_state = PS2_RECEIVE_ACK_RESET;
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_Start
+ Description:   Queue a device reset and start its asynchronous handshake.
+ Parameters:    channel = channel to reset
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_Start(PS2Channel *channel)
+{
+    channel->tx_read = channel->tx_insert;
+    channel->state = PS2_STATE_WANT_BAT;
+    channel->device_type = PS2_DEVICE_UNKNOWN;
+    channel->receive_state = PS2_RECEIVE_ACK_RESET;
+    PS2Protocol_QueueByte(channel, PS2_COMMAND_RESET);
+    PS2Protocol_StartTransmit(channel);
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_SetLEDs
+ Description:   Queue a keyboard LED update after device discovery.
+ Parameters:    channel = candidate keyboard channel, leds = PS/2 LED mask
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_SetLEDs(PS2Channel *channel, uint8_t leds)
+{
+    if (channel->device_type != PS2_DEVICE_KEYBOARD)
+        return;
+    PS2Protocol_QueueByte(channel, PS2_COMMAND_SET_LEDS);
+    PS2Protocol_QueueByte(channel, leds);
+    PS2Protocol_StartTransmit(channel);
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_TransmitInterrupt
+ Description:   Service one queued PS/2 command byte.
+ Parameters:    channel = channel requesting transmit
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_TransmitInterrupt(PS2Channel *channel)
+{
+    uint8_t byte;
+
+    PS2HW_EnableReceive(channel);
+    if (channel->tx_read == channel->tx_insert)
+        return;
+    byte = channel->tx_buffer[channel->tx_read];
+    channel->tx_read = (uint8_t)((channel->tx_read + 1) % PS2_TX_BUFFER_SIZE);
+    channel->state |= PS2_STATE_WANT_ACK;
+    PS2HW_TransmitByte(channel, byte);
+}
+
+/*******************************************************************
+ Function:      PS2Protocol_ReceiveByte
+ Description:   Advance the PS/2 device protocol for a received byte.
+ Parameters:    channel = source channel, byte = received byte
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_ReceiveByte(PS2Channel *channel, uint8_t byte)
+{
+    channel->state &= ~PS2_STATE_WANT_ACK;
+    if (byte == PS2_RESEND)
+    {
+        if (channel->resend_count-- != 0)
+            PS2Protocol_PrependLastByte(channel);
+        else
+            channel->tx_read = channel->tx_insert;
+        PS2Protocol_StartTransmit(channel);
+        return;
+    }
+
+    switch (channel->receive_state)
+    {
+    case PS2_RECEIVE_ACK_RESET:
+        if (byte == PS2_ACK)
+            channel->receive_state = PS2_RECEIVE_BAT;
+        break;
+
+    case PS2_RECEIVE_BAT:
+        if (byte == PS2_BAT)
+        {
+            channel->state &= ~PS2_STATE_WANT_BAT;
+            PS2Protocol_QueueByte(channel, PS2_COMMAND_SET_RATE);
+            channel->receive_state = PS2_RECEIVE_DEVICE_ID;
+            PS2Protocol_StartTransmit(channel);
+        }
+        break;
+
+    case PS2_RECEIVE_DEVICE_ID:
+        if (byte == PS2_ACK)
+            break;
+        if (byte == PS2_MOUSE_ID)
+        {
+            channel->device_type = PS2_DEVICE_MOUSE;
+            channel->setup_phase = 0;
+            channel->setup_index = 0;
+            channel->receive_state = PS2_RECEIVE_MOUSE_SETUP;
+        }
+        else
+        {
+            channel->device_type = PS2_DEVICE_KEYBOARD;
+            PS2Protocol_QueueByte(channel, 0x7f);
+            channel->receive_state = PS2_RECEIVE_KEYBOARD;
+            (void)_swix(OS_CallAVector, _INR(0, 1) | _IN(9),
+                        KEYV_KeyboardPresent, 2, KEYV);
+        }
+        break;
+
+    case PS2_RECEIVE_MOUSE_SETUP:
+        if (byte == PS2_ACK)
+            PS2Protocol_SendNextSetupByte(channel);
+        break;
+
+    case PS2_RECEIVE_MOUSE_ID:
+        if (byte == 3 || byte == 4)
+            channel->device_type = PS2_DEVICE_INTELLIMOUSE;
+        if (byte == 4 && channel->setup_phase == 0)
+        {
+            channel->device_type = PS2_DEVICE_INTELLIMOUSE5;
+            channel->setup_phase = 1;
+            channel->setup_index = 0;
+            channel->receive_state = PS2_RECEIVE_MOUSE_SETUP;
+        }
+        else
+        {
+            channel->setup_phase = 2;
+            channel->setup_index = 0;
+            channel->receive_state = PS2_RECEIVE_MOUSE_SETUP;
+            PS2Protocol_SendNextSetupByte(channel);
+        }
+        break;
+
+    case PS2_RECEIVE_MOUSE_PACKET_1:
+        channel->packet[0] = byte;
+        channel->receive_state = PS2_RECEIVE_MOUSE_PACKET_2;
+        break;
+
+    case PS2_RECEIVE_MOUSE_PACKET_2:
+        channel->packet[1] = byte;
+        channel->receive_state = PS2_RECEIVE_MOUSE_PACKET_3;
+        break;
+
+    case PS2_RECEIVE_MOUSE_PACKET_3:
+        channel->packet[2] = byte;
+        if (channel->device_type == PS2_DEVICE_INTELLIMOUSE ||
+            channel->device_type == PS2_DEVICE_INTELLIMOUSE5)
+            channel->receive_state = PS2_RECEIVE_MOUSE_PACKET_4;
+        else
+        {
+            PS2Mouse_ReceivePacket(channel);
+            channel->receive_state = PS2_RECEIVE_MOUSE_PACKET_1;
+        }
+        break;
+
+    case PS2_RECEIVE_MOUSE_PACKET_4:
+        channel->packet[3] = byte;
+        PS2Mouse_ReceivePacket(channel);
+        channel->receive_state = PS2_RECEIVE_MOUSE_PACKET_1;
+        break;
+
+    case PS2_RECEIVE_KEYBOARD:
+        PS2Keyboard_ReceiveByte(byte);
+        break;
+
+    default:
+        break;
+    }
+    PS2Protocol_StartTransmit(channel);
+}

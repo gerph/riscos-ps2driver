@@ -1,0 +1,209 @@
+/*******************************************************************
+ * File:        ps2
+ * Purpose:     Shared PS/2 driver state and layer interfaces.
+ * Author:      Gerph
+ ******************************************************************/
+
+#ifndef PS2_H
+#define PS2_H
+
+#include <stdint.h>
+
+#include "kernel.h"
+
+#define PS2_PORT_KEYBOARD 1
+#define PS2_PORT_MOUSE 2
+#define PS2_PORT_PSEUDO 3
+
+#define PS2_DEVICE_UNKNOWN 0
+#define PS2_DEVICE_MOUSE 1
+#define PS2_DEVICE_KEYBOARD 2
+#define PS2_DEVICE_INTELLIMOUSE 3
+#define PS2_DEVICE_INTELLIMOUSE5 4
+
+#define PS2_STATE_RESET 0x01
+#define PS2_STATE_KEYUP 0x02
+#define PS2_STATE_WANT_ACK 0x04
+#define PS2_STATE_WANT_BAT 0x08
+#define PS2_STATE_SPECIAL 0x10
+#define PS2_STATE_BREAK 0x20
+
+#define PS2_TX_BUFFER_SIZE 16
+#define PS2_RESEND_COUNT 10
+
+typedef enum PS2ReceiveState
+{
+    PS2_RECEIVE_ACK_RESET,
+    PS2_RECEIVE_BAT,
+    PS2_RECEIVE_DEVICE_ID,
+    PS2_RECEIVE_MOUSE_SETUP,
+    PS2_RECEIVE_MOUSE_ID,
+    PS2_RECEIVE_MOUSE_PACKET_1,
+    PS2_RECEIVE_MOUSE_PACKET_2,
+    PS2_RECEIVE_MOUSE_PACKET_3,
+    PS2_RECEIVE_MOUSE_PACKET_4,
+    PS2_RECEIVE_KEYBOARD,
+    PS2_RECEIVE_SINK
+} PS2ReceiveState;
+
+typedef struct PS2Channel
+{
+    uint8_t tx_buffer[PS2_TX_BUFFER_SIZE];
+    uint8_t tx_insert;
+    uint8_t tx_read;
+    uint8_t port;
+    uint8_t state;
+    uint8_t resend_count;
+    uint8_t device_type;
+    uint8_t packet[4];
+    uint8_t setup_index;
+    uint8_t setup_phase;
+    PS2ReceiveState receive_state;
+} PS2Channel;
+
+typedef struct PS2MouseState
+{
+    int32_t delta_x;
+    int32_t delta_y;
+    int32_t alternate_x;
+    int32_t alternate_y;
+    uint32_t buttons;
+    uint32_t last_buttons;
+} PS2MouseState;
+
+typedef struct PS2DriverState
+{
+    PS2Channel channels[3];
+    PS2MouseState mouse;
+    uint8_t keyboard_state;
+    uint8_t led_state;
+    uint8_t key_down[32];
+    uint32_t last_key;
+    int port_count;
+    int vectors_claimed;
+    int hardware_running;
+} PS2DriverState;
+
+extern PS2DriverState ps2_state;
+
+/*******************************************************************
+ Function:      PS2HW_Initialise
+ Description:   Initialise one hardware channel and reset its controller.
+ Parameters:    channel = channel to initialise
+ Returns:       none
+ ******************************************************************/
+void PS2HW_Initialise(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2HW_EnableTransmit
+ Description:   Enable transmit interrupts for a channel.
+ Parameters:    channel = channel to enable
+ Returns:       none
+ ******************************************************************/
+void PS2HW_EnableTransmit(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2HW_EnableReceive
+ Description:   Enable receive interrupts for a channel.
+ Parameters:    channel = channel to enable
+ Returns:       none
+ ******************************************************************/
+void PS2HW_EnableReceive(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2HW_Disable
+ Description:   Disable a hardware channel and its interrupts.
+ Parameters:    channel = channel to disable
+ Returns:       none
+ ******************************************************************/
+void PS2HW_Disable(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2HW_TransmitByte
+ Description:   Write a byte to a physical PS/2 port.
+ Parameters:    channel = destination channel, byte = value to send
+ Returns:       none
+ ******************************************************************/
+void PS2HW_TransmitByte(PS2Channel *channel, uint8_t byte);
+
+/*******************************************************************
+ Function:      PS2HW_ReadByte
+ Description:   Read a physical PS/2 port and validate its odd parity.
+ Parameters:    channel = source channel, byte = returned byte
+ Returns:       non-zero when a valid byte was read
+ ******************************************************************/
+int PS2HW_ReadByte(PS2Channel *channel, uint8_t *byte);
+
+/*******************************************************************
+ Function:      PS2Protocol_Initialise
+ Description:   Initialise protocol state for a channel.
+ Parameters:    channel = channel to initialise
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_Initialise(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2Protocol_Start
+ Description:   Reset a channel and begin device detection.
+ Parameters:    channel = channel to start
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_Start(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2Protocol_ReceiveByte
+ Description:   Feed one received PS/2 byte into its channel state machine.
+ Parameters:    channel = source channel, byte = received byte
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_ReceiveByte(PS2Channel *channel, uint8_t byte);
+
+/*******************************************************************
+ Function:      PS2Protocol_SetLEDs
+ Description:   Queue the keyboard LED update for a keyboard channel.
+ Parameters:    channel = channel to update, leds = PS/2 LED mask
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_SetLEDs(PS2Channel *channel, uint8_t leds);
+
+/*******************************************************************
+ Function:      PS2Protocol_TransmitInterrupt
+ Description:   Service one transmit interrupt for a channel.
+ Parameters:    channel = channel requiring service
+ Returns:       none
+ ******************************************************************/
+void PS2Protocol_TransmitInterrupt(PS2Channel *channel);
+
+/*******************************************************************
+ Function:      PS2Keyboard_Initialise
+ Description:   Reset keyboard translation and key state.
+ Parameters:    none
+ Returns:       none
+ ******************************************************************/
+void PS2Keyboard_Initialise(void);
+
+/*******************************************************************
+ Function:      PS2Keyboard_ReceiveByte
+ Description:   Translate a keyboard scan-code byte and notify KeyV.
+ Parameters:    byte = received scan-code byte
+ Returns:       none
+ ******************************************************************/
+void PS2Keyboard_ReceiveByte(uint8_t byte);
+
+/*******************************************************************
+ Function:      PS2Mouse_Initialise
+ Description:   Reset accumulated mouse movement and buttons.
+ Parameters:    none
+ Returns:       none
+ ******************************************************************/
+void PS2Mouse_Initialise(void);
+
+/*******************************************************************
+ Function:      PS2Mouse_ReceivePacket
+ Description:   Decode a complete PS/2 mouse packet.
+ Parameters:    channel = reporting channel
+ Returns:       none
+ ******************************************************************/
+void PS2Mouse_ReceivePacket(PS2Channel *channel);
+
+#endif

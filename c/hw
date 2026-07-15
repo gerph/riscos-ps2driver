@@ -1,0 +1,180 @@
+/*******************************************************************
+ * File:        hw
+ * Purpose:     IOMD and pseudo-port access for the PS/2 driver.
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <stdint.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "riscos/KEYV.h"
+#include "riscos/Vectors.h"
+#include "ps2.h"
+
+#define IOMD_BASE 0x03200000U
+#define IOMD_KBDCR 0x008U
+#define IOMD_IRQMSKD 0x078U
+#define IOMD_MSEDAT 0x0a8U
+#define IOMD_MSECR 0x0acU
+#define IOMD_PS2_DATA 0x004U
+#define IOMD_STATE_MACHINE_ENABLE 0x08U
+#define IOMD_RX_INTERRUPT 0x20U
+#define IOMD_TX_INTERRUPT 0x80U
+#define IOMD_MOUSE_RX_BIT 0x01U
+#define IOMD_MOUSE_TX_BIT 0x02U
+
+/*******************************************************************
+ Function:      PS2HW_Register
+ Description:   Return an IOMD byte register.
+ Parameters:    offset = IOMD register offset
+ Returns:       volatile register pointer
+ ******************************************************************/
+static volatile uint8_t *PS2HW_Register(uint32_t offset)
+{
+    return (volatile uint8_t *)(uintptr_t)(IOMD_BASE + offset);
+}
+
+/*******************************************************************
+ Function:      PS2HW_ParityValid
+ Description:   Check a PS/2 byte's odd parity against its status bit.
+ Parameters:    byte = received data, status = PS/2 control register
+ Returns:       non-zero if parity is valid
+ ******************************************************************/
+static int PS2HW_ParityValid(uint8_t byte, uint8_t status)
+{
+    uint8_t parity;
+
+    parity = byte;
+    parity ^= (uint8_t)(parity >> 4);
+    parity ^= (uint8_t)(parity >> 2);
+    parity ^= (uint8_t)(parity >> 1);
+    parity ^= (uint8_t)(status >> 2);
+    return (parity & 1) != 0;
+}
+
+/*******************************************************************
+ Function:      PS2HW_Initialise
+ Description:   Enable the PS/2 state machine with interrupts disabled.
+ Parameters:    channel = channel to initialise
+ Returns:       none
+ ******************************************************************/
+void PS2HW_Initialise(PS2Channel *channel)
+{
+    if (channel->port == PS2_PORT_KEYBOARD)
+        *PS2HW_Register(IOMD_KBDCR) = IOMD_STATE_MACHINE_ENABLE;
+    else if (channel->port == PS2_PORT_MOUSE)
+        *PS2HW_Register(IOMD_MSECR) = IOMD_STATE_MACHINE_ENABLE;
+    else
+        (void)_swix(OS_CallAVector, _INR(0, 1) | _IN(9),
+                    KEYV_PseudoEnable, channel, KEYV);
+}
+
+/*******************************************************************
+ Function:      PS2HW_EnableTransmit
+ Description:   Enable transmit and disable receive interrupts.
+ Parameters:    channel = channel to enable
+ Returns:       none
+ ******************************************************************/
+void PS2HW_EnableTransmit(PS2Channel *channel)
+{
+    uint8_t mask;
+
+    if (channel->port == PS2_PORT_KEYBOARD)
+        *PS2HW_Register(IOMD_KBDCR) = IOMD_STATE_MACHINE_ENABLE | IOMD_TX_INTERRUPT;
+    else if (channel->port == PS2_PORT_MOUSE)
+    {
+        mask = *PS2HW_Register(IOMD_IRQMSKD);
+        mask = (uint8_t)((mask | IOMD_MOUSE_TX_BIT) & ~IOMD_MOUSE_RX_BIT);
+        *PS2HW_Register(IOMD_IRQMSKD) = mask;
+    }
+    else
+        (void)_swix(OS_CallAVector, _INR(0, 1) | _IN(9),
+                    KEYV_PseudoIntMask, 2, KEYV);
+}
+
+/*******************************************************************
+ Function:      PS2HW_EnableReceive
+ Description:   Enable receive and disable transmit interrupts.
+ Parameters:    channel = channel to enable
+ Returns:       none
+ ******************************************************************/
+void PS2HW_EnableReceive(PS2Channel *channel)
+{
+    uint8_t mask;
+
+    if (channel->port == PS2_PORT_KEYBOARD)
+        *PS2HW_Register(IOMD_KBDCR) = IOMD_STATE_MACHINE_ENABLE | IOMD_RX_INTERRUPT;
+    else if (channel->port == PS2_PORT_MOUSE)
+    {
+        mask = *PS2HW_Register(IOMD_IRQMSKD);
+        mask = (uint8_t)((mask | IOMD_MOUSE_RX_BIT) & ~IOMD_MOUSE_TX_BIT);
+        *PS2HW_Register(IOMD_IRQMSKD) = mask;
+    }
+    else
+        (void)_swix(OS_CallAVector, _INR(0, 1) | _IN(9),
+                    KEYV_PseudoIntMask, 1, KEYV);
+}
+
+/*******************************************************************
+ Function:      PS2HW_Disable
+ Description:   Disable a PS/2 state machine and its interrupts.
+ Parameters:    channel = channel to disable
+ Returns:       none
+ ******************************************************************/
+void PS2HW_Disable(PS2Channel *channel)
+{
+    uint8_t mask;
+
+    if (channel->port == PS2_PORT_KEYBOARD)
+        *PS2HW_Register(IOMD_KBDCR) = 0;
+    else if (channel->port == PS2_PORT_MOUSE)
+    {
+        mask = *PS2HW_Register(IOMD_IRQMSKD);
+        *PS2HW_Register(IOMD_IRQMSKD) =
+            (uint8_t)(mask & ~(IOMD_MOUSE_RX_BIT | IOMD_MOUSE_TX_BIT));
+        *PS2HW_Register(IOMD_MSECR) = 0;
+    }
+    else
+        (void)_swix(OS_CallAVector, _INR(0, 1) | _IN(9),
+                    KEYV_PseudoDisable, channel, KEYV);
+}
+
+/*******************************************************************
+ Function:      PS2HW_TransmitByte
+ Description:   Write a byte to a physical or pseudo PS/2 channel.
+ Parameters:    channel = destination channel, byte = byte to send
+ Returns:       none
+ ******************************************************************/
+void PS2HW_TransmitByte(PS2Channel *channel, uint8_t byte)
+{
+    if (channel->port == PS2_PORT_KEYBOARD)
+        *PS2HW_Register(IOMD_PS2_DATA) = byte;
+    else if (channel->port == PS2_PORT_MOUSE)
+        *PS2HW_Register(IOMD_MSEDAT) = byte;
+}
+
+/*******************************************************************
+ Function:      PS2HW_ReadByte
+ Description:   Read and parity-check a byte from a physical PS/2 channel.
+ Parameters:    channel = source channel, byte = returned byte
+ Returns:       non-zero when parity was valid
+ ******************************************************************/
+int PS2HW_ReadByte(PS2Channel *channel, uint8_t *byte)
+{
+    uint8_t status;
+
+    if (channel->port == PS2_PORT_KEYBOARD)
+    {
+        status = *PS2HW_Register(IOMD_KBDCR);
+        *byte = *PS2HW_Register(IOMD_PS2_DATA);
+    }
+    else if (channel->port == PS2_PORT_MOUSE)
+    {
+        status = *PS2HW_Register(IOMD_MSECR);
+        *byte = *PS2HW_Register(IOMD_MSEDAT);
+    }
+    else
+        return 0;
+    return PS2HW_ParityValid(*byte, status);
+}

@@ -1,0 +1,79 @@
+/*******************************************************************
+ * File:        mouse
+ * Purpose:     PS/2 mouse packet decoding and PointerV state.
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <stdint.h>
+
+#include "ps2.h"
+
+/*******************************************************************
+ Function:      PS2Mouse_SignExtend9
+ Description:   Form a signed nine-bit movement value from a packet byte.
+ Parameters:    value = low eight bits, sign = PS/2 sign bit
+ Returns:       signed movement value
+ ******************************************************************/
+static int32_t PS2Mouse_SignExtend9(uint8_t value, uint8_t sign)
+{
+    int32_t result;
+
+    result = (int32_t)value | ((int32_t)sign << 8);
+    if ((result & 0x100) != 0)
+        result -= 0x200;
+    return result;
+}
+
+/*******************************************************************
+ Function:      PS2Mouse_Initialise
+ Description:   Reset movement, wheel, and button accumulators.
+ Parameters:    none
+ Returns:       none
+ ******************************************************************/
+void PS2Mouse_Initialise(void)
+{
+    ps2_state.mouse.delta_x = 0;
+    ps2_state.mouse.delta_y = 0;
+    ps2_state.mouse.alternate_x = 0;
+    ps2_state.mouse.alternate_y = 0;
+    ps2_state.mouse.buttons = 0;
+    ps2_state.mouse.last_buttons = 0;
+}
+
+/*******************************************************************
+ Function:      PS2Mouse_ReceivePacket
+ Description:   Decode a three or four byte PS/2 mouse report.
+ Parameters:    channel = channel containing the completed packet
+ Returns:       none
+ ******************************************************************/
+void PS2Mouse_ReceivePacket(PS2Channel *channel)
+{
+    uint8_t header;
+    uint32_t buttons;
+    int32_t wheel;
+
+    header = channel->packet[0];
+    if ((header & 0x08) == 0)
+        return;
+    ps2_state.mouse.delta_x += PS2Mouse_SignExtend9(channel->packet[1],
+                                                      (uint8_t)(header >> 4));
+    ps2_state.mouse.delta_y += PS2Mouse_SignExtend9(channel->packet[2],
+                                                      (uint8_t)(header >> 5));
+    buttons = (uint32_t)((header & 1) << 2);
+    buttons |= (uint32_t)(header & 2);
+    buttons |= (uint32_t)((header & 4) >> 2);
+    if (channel->device_type == PS2_DEVICE_INTELLIMOUSE5)
+    {
+        buttons |= (uint32_t)((channel->packet[3] & 0x10) << 3);
+        buttons |= (uint32_t)((channel->packet[3] & 0x20) << 3);
+    }
+    ps2_state.mouse.buttons = buttons;
+    if (channel->device_type == PS2_DEVICE_INTELLIMOUSE ||
+        channel->device_type == PS2_DEVICE_INTELLIMOUSE5)
+    {
+        wheel = (int32_t)(channel->packet[3] & 0x0f);
+        if ((wheel & 8) != 0)
+            wheel -= 16;
+        ps2_state.mouse.alternate_y -= wheel;
+    }
+}

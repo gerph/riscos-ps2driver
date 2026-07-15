@@ -1,0 +1,154 @@
+/*******************************************************************
+ * File:        keyboard
+ * Purpose:     PS/2 set-2 scan-code translation and KeyV reporting.
+ * Author:      Gerph
+ ******************************************************************/
+
+#include <stdint.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "riscos/KEYV.h"
+#include "riscos/Vectors.h"
+#include "ps2.h"
+
+#define PS2_KEY_UNMAPPED 0xffU
+#define PS2_KEY_SPECIAL 0xe0U
+#define PS2_KEY_BREAK 0xe1U
+#define PS2_KEY_UP 0xf0U
+#define PS2_KEY_ACK 0xfaU
+#define PS2_KEY_BAT 0xaaU
+
+static const uint8_t key_table[136] =
+{
+    0xff,9,0xff,5,3,1,2,12, 0xff,10,8,6,4,38,16,0xff,
+    0xff,94,76,109,59,39,17,0xff, 0xff,0xff,78,61,60,40,18,0xff,
+    0xff,80,79,62,41,20,19,0xff, 0xff,95,81,63,43,42,21,0xff,
+    0xff,0xff,83,66,45,23,24,0xff, 0xff,85,67,46,47,26,25,0xff,
+    0xff,86,87,68,69,48,27,0xff, 0xff,110,70,0xff,49,28,0xff,0xff,
+    93,88,71,50,0xff,51,0xff,0xff, 0xff,77,0xff,0xff,108,0xff,30,107,
+    0xff,90,29,72,55,0xff,0xff,0xff, 101,102,91,73,74,56,0,34,
+    11,75,92,58,36,57,14,0xff, 0xff,0xff,0xff,7,13,0xff,0xff,0xff
+};
+
+static const uint8_t special_table[136] =
+{
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+    142,96,0xff,0xff,97,132,0xff,0xff, 148,0xff,0xff,0xff,0xff,0xff,0xff,104,
+    147,137,0xff,135,0xff,0xff,0xff,105, 146,0xff,0xff,140,0xff,0xff,0xff,106,
+    145,136,0xff,134,0xff,0xff,0xff,128, 144,143,133,0xff,0xff,0xff,0xff,129,
+    141,0xff,0xff,0xff,0xff,0xff,0xff,0xff, 139,0xff,35,0xff,0xff,131,0xff,0xff,
+    138,0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0xff,0xff,103,0xff,0xff,0xff,130,0xff,
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0xff,53,0xff,98,32,0xff,0xff,0xff,
+    31,52,99,0xff,100,89,0xff,15, 0xff,0xff,54,0xff,13,33,15,0xff,
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+};
+
+static const uint32_t extended_key_map[21] =
+{
+    0x010081,0x010082,0x010083,0x0c00b5,0x0c00b6,0x0c00b7,0x0c00cd,
+    0x0c00e2,0x0c00e9,0x0c00ea,0x0c0183,0x0c018a,0x0c0192,0x0c0194,
+    0x0c0221,0x0c0223,0x0c0224,0x0c0225,0x0c0226,0x0c0227,0x0c0228
+};
+
+/*******************************************************************
+ Function:      PS2Keyboard_Initialise
+ Description:   Reset scan-code and autorepeat-suppression state.
+ Parameters:    none
+ Returns:       none
+ ******************************************************************/
+void PS2Keyboard_Initialise(void)
+{
+    uint32_t index;
+
+    ps2_state.keyboard_state = PS2_STATE_RESET;
+    ps2_state.last_key = 0;
+    for (index = 0; index < sizeof(ps2_state.key_down); index++)
+        ps2_state.key_down[index] = 0;
+}
+
+/*******************************************************************
+ Function:      PS2Keyboard_Report
+ Description:   Send one translated key transition to KeyV.
+ Parameters:    key = RISC OS low-level or HID key, pressed = transition type
+ Returns:       none
+ ******************************************************************/
+static void PS2Keyboard_Report(uint32_t key, int pressed)
+{
+    if (key < 0x80)
+        (void)_swix(OS_CallAVector, _INR(0, 1) | _IN(9),
+                    pressed ? KEYV_KeyPress : KEYV_KeyRelease, key, KEYV);
+    else if (key - 0x80 < sizeof(extended_key_map) / sizeof(extended_key_map[0]))
+        (void)_swix(OS_CallAVector, _INR(0, 4) | _IN(9),
+                    KEYV_StateChange, extended_key_map[key - 0x80],
+                    pressed ? 1 : 0, KEYV_StateChange_SourceSimple, 0, KEYV);
+}
+
+/*******************************************************************
+ Function:      PS2Keyboard_ReceiveByte
+ Description:   Translate a set-2 scan-code byte, suppressing autorepeat.
+ Parameters:    byte = received scan-code byte
+ Returns:       none
+ ******************************************************************/
+void PS2Keyboard_ReceiveByte(uint8_t byte)
+{
+    const uint8_t *table;
+    uint8_t key;
+    uint8_t mask;
+    int pressed;
+    int special;
+
+    if (byte == PS2_KEY_BAT)
+    {
+        ps2_state.keyboard_state |= PS2_STATE_RESET;
+        return;
+    }
+    if (byte == PS2_KEY_ACK || ps2_state.keyboard_state & PS2_STATE_RESET)
+        return;
+    if (byte == PS2_KEY_UP)
+    {
+        ps2_state.keyboard_state |= PS2_STATE_KEYUP;
+        return;
+    }
+    if (byte == PS2_KEY_SPECIAL)
+    {
+        ps2_state.keyboard_state |= PS2_STATE_SPECIAL;
+        return;
+    }
+    if (byte == PS2_KEY_BREAK)
+    {
+        if (ps2_state.keyboard_state & PS2_STATE_BREAK)
+        {
+            ps2_state.keyboard_state &= ~PS2_STATE_BREAK;
+            ps2_state.keyboard_state |= PS2_STATE_SPECIAL;
+        }
+        else
+            ps2_state.keyboard_state |= PS2_STATE_BREAK;
+        return;
+    }
+    if (byte >= sizeof(key_table))
+    {
+        ps2_state.keyboard_state = 0;
+        return;
+    }
+    special = (ps2_state.keyboard_state & PS2_STATE_SPECIAL) != 0;
+    table = special ? special_table : key_table;
+    ps2_state.keyboard_state &= ~PS2_STATE_SPECIAL;
+    key = table[byte];
+    ps2_state.last_key = byte | (special ? 0x10000U : 0);
+    if (key == PS2_KEY_UNMAPPED)
+    {
+        ps2_state.keyboard_state = 0;
+        return;
+    }
+    mask = (uint8_t)(1U << (key & 7));
+    pressed = (ps2_state.keyboard_state & PS2_STATE_KEYUP) == 0;
+    ps2_state.keyboard_state &= ~PS2_STATE_KEYUP;
+    if (pressed && (ps2_state.key_down[key >> 3] & mask) != 0)
+        return;
+    if (pressed)
+        ps2_state.key_down[key >> 3] |= mask;
+    else
+        ps2_state.key_down[key >> 3] &= (uint8_t)~mask;
+    PS2Keyboard_Report(key, pressed);
+}
